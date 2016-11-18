@@ -14,7 +14,11 @@ func main() {
 			return
 		}
 
-		// TODO: MaxBytesReader
+		if len(r.URL.RawQuery) > MaxQueryStringLength {
+			http.Error(w, "query string exceeded length limit", http.StatusRequestURITooLong)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 
 		err := r.ParseForm()
 		if err != nil {
@@ -39,3 +43,8 @@ func main() {
 
 	http.ListenAndServe("127.0.0.1:2017", nil)
 }
+
+const (
+	MaxQueryStringLength = 1024 * 100
+	MaxBodyBytes         = 1024 * 1024 * 10
+)
