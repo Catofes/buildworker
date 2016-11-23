@@ -1,11 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 
 	"github.com/caddyserver/buildworker"
 )
+
+var addr = "127.0.0.1:2017"
 
 func main() {
 	http.HandleFunc("/deploy-plugin", func(w http.ResponseWriter, r *http.Request) {
@@ -27,21 +30,22 @@ func main() {
 			return
 		}
 
-		repo, commit := r.Form.Get("repo"), r.Form.Get("commit")
-		if repo == "" || commit == "" {
+		pkg, version := r.Form.Get("package"), r.Form.Get("version")
+		if pkg == "" || version == "" {
 			http.Error(w, "missing required fields", http.StatusBadRequest)
 			return
 		}
 
-		err = buildworker.DeployPlugin(repo, commit)
+		err = buildworker.DeployPlugin(pkg, version)
 		if err != nil {
-			log.Printf("checking plugin: %v", err)
+			log.Printf("deploying plugin: %v", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	})
 
-	http.ListenAndServe("127.0.0.1:2017", nil)
+	fmt.Println("Build worker serving on", addr)
+	http.ListenAndServe(addr, nil)
 }
 
 const (
