@@ -3,19 +3,35 @@ package buildworker
 import (
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
+
+func init() {
+	var err error
+	absoluteMasterGopath, err = filepath.Abs(masterGopath)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
 
 // A Workspace is a folder path which will hold one or more GOPATHs.
 type Workspace string
 
 // workspace is where we do concurrent builds and tests.
-var workspace = Workspace("./workspace")
+const workspace = Workspace("./workspace")
 
 // masterGopath is where we store our master copy of repos.
-var masterGopath = "./gopath"
+const masterGopath = "./gopath"
+
+// masterGopathMu protects the masterGopath from concurrent writes.
+var masterGopathMu sync.RWMutex
+
+// absoluteMasterGopath is the absolute form of masterGopath.
+var absoluteMasterGopath string
 
 type LogBuffer struct{ io.Writer }
 
@@ -36,16 +52,16 @@ func (b LogBuffer) Printf(format string, a ...interface{}) {
 
 // CaddyPlugin holds information about a Caddy plugin to build.
 type CaddyPlugin struct {
-	Repo    string // git clone URL
-	Package string // fully qualified package import path
-	Version string // commit, tag, or branch to checkout
+	Repo    string `json:"repo"`    // git clone URL
+	Package string `json:"package"` // fully qualified package import path
+	Version string `json:"version"` // commit, tag, or branch to checkout
 }
 
 // BuildConfig holds information to conduct a build of some
 // version of Caddy and a number of plugins.
 type BuildConfig struct {
-	CaddyVersion string
-	Plugins      []CaddyPlugin
+	CaddyVersion string        `json:"caddy_version"`
+	Plugins      []CaddyPlugin `json:"plugins"`
 }
 
 // DeployCaddy begins the pipeline that deploys
@@ -62,28 +78,62 @@ func DeployCaddy(version string, allPlugins []CaddyPlugin) error {
 		return err
 	}
 
-	absMasterGopath, err := filepath.Abs(masterGopath)
-	if err != nil {
-		return fmt.Errorf("absolute path for master GOPATH: %v", err)
-	}
-
 	deployEnv := BuildEnv{
 		Log:     be.Log,
 		EnvPath: be.EnvPath,
-		Gopath:  absMasterGopath,
+		Gopath:  absoluteMasterGopath,
 		BuildCfg: BuildConfig{
 			CaddyVersion: version,
 			Plugins:      allPlugins,
 		},
 	}
 
-	return deployCaddy(deployEnv)
+	return deploy(CaddyPackage, deployEnv)
 }
 
-// TODO: Lock the master gopath somehow... only one deploy allowed at a time
-func deployCaddy(deployEnv BuildEnv) error {
+// DeployPlugin begins the pipeline that deploys a new plugin.
+// It blocks until the plugin is finished deploying, or an error
+// occurs.
+func DeployPlugin(pkg, version string, allPlugins []CaddyPlugin) error {
+	be, err := newBuildEnv("master", []CaddyPlugin{ // TODO: which version is currently deployed...?
+		{Package: pkg, Version: version}, // TODO: repo URL?
+	})
+	if err != nil {
+		return err
+	}
+	defer be.cleanup()
+
+	err = checkPlugin(be)
+	if err != nil {
+		return err
+	}
+
+	deployEnv := BuildEnv{
+		Log:     be.Log,
+		EnvPath: be.EnvPath,
+		Gopath:  absoluteMasterGopath,
+		BuildCfg: BuildConfig{
+			CaddyVersion: be.BuildCfg.CaddyVersion,
+			Plugins:      allPlugins,
+		},
+	}
+
+	return deploy(pkg, deployEnv)
+}
+
+func deploy(pkg string, deployEnv BuildEnv) error {
+	masterGopathMu.Lock()
+	defer masterGopathMu.Unlock()
+
+	for _, plugin := range deployEnv.BuildCfg.Plugins {
+		err := deployEnv.gitCheckout(deployEnv.RepoPath(plugin.Package), "-")
+		if err != nil {
+			return fmt.Errorf("resetting git checkout: %v", err)
+		}
+	}
+
 	// run `go get -u` to get the latest into the master GOPATH.
-	cmd := deployEnv.makeCommand(true, "go", "get", "-u", "-d", "-x", CaddyPackage+"/...")
+	cmd := deployEnv.makeCommand(true, "go", "get", "-u", "-d", "-x", pkg+"/...")
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("go get into deploy env: %v", err)
@@ -101,20 +151,6 @@ func deployCaddy(deployEnv BuildEnv) error {
 	return nil
 }
 
-// DeployPlugin begins the pipeline that deploys a new plugin.
-// It blocks until the plugin is finished deploying, or an error
-// occurs.
-func DeployPlugin(pkg, version string) error {
-	err := CheckPlugin(pkg, version)
-	if err != nil {
-		return err
-	}
-
-	// TODO: Perform deploy
-
-	return fmt.Errorf("not implemented")
-}
-
 func CheckPlugin(pkg, version string) error {
 	be, err := newBuildEnv("master", []CaddyPlugin{ // TODO: latest caddy version...?
 		{Package: pkg, Version: version}, // TODO: repo URL?
@@ -123,19 +159,13 @@ func CheckPlugin(pkg, version string) error {
 		return err
 	}
 	defer be.cleanup()
+	return checkPlugin(be)
+}
 
-	err = be.setup()
+func checkPlugin(be BuildEnv) error {
+	err := be.setup()
 	if err != nil {
 		return err
-	}
-
-	// go build
-	be.Log.Println("go build checks")
-	for _, plugin := range be.BuildCfg.Plugins {
-		err = be.goBuildChecks(plugin.Package)
-		if err != nil {
-			return fmt.Errorf("go build: %v", err)
-		}
 	}
 
 	// go vet the plugin
@@ -153,6 +183,15 @@ func CheckPlugin(pkg, version string) error {
 		err = be.goTest(plugin.Package)
 		if err != nil {
 			return fmt.Errorf("go test plugin: %v", err)
+		}
+	}
+
+	// go build
+	be.Log.Println("go build checks")
+	for _, plugin := range be.BuildCfg.Plugins {
+		err = be.goBuildChecks(plugin.Package)
+		if err != nil {
+			return fmt.Errorf("go build: %v", err)
 		}
 	}
 

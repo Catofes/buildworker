@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -32,13 +33,14 @@ type BuildEnv struct {
 	// The absolute GOPATH being used, as found in Workspace
 	Gopath string
 
+	// The configuration to use for builds
 	BuildCfg BuildConfig
 }
 
 func newBuildEnv(caddyVersion string, plugins []CaddyPlugin) (BuildEnv, error) {
 	be := BuildEnv{
 		Workspace: workspace,
-		Log:       LogBuffer{Writer: new(bytes.Buffer)},
+		Log:       LogBuffer{Writer: os.Stdout}, //LogBuffer{Writer: new(bytes.Buffer)},
 		EnvPath:   os.Getenv("PATH"),
 		BuildCfg: BuildConfig{
 			CaddyVersion: caddyVersion,
@@ -217,6 +219,12 @@ func (be BuildEnv) makeCommand(withEnvPath bool, command string, args ...string)
 	return cmd
 }
 
+// TODO: Use this...
+func (be BuildEnv) runCommand(cmd *exec.Cmd) error {
+	be.Log.Printf(cmd.Path, strings.Join(cmd.Args, " "))
+	return cmd.Run()
+}
+
 // Platform contains information about platforms. The values of
 // OS, Arch, and ARM should be the same values to set GOOS,
 // GOARCH, and GOARM to, respectively. The values of the json
@@ -305,5 +313,5 @@ const (
 	CaddyPackage       = "github.com/mholt/caddy"
 	//CaddyMainPackage   = "github.com/mholt/caddy/caddy" // TODO: Probably used when building a binary, right?
 	//CaddyRepo = "https://github.com/mholt/caddy.git"
-	ParallelBuildOps = 2
+	ParallelBuildOps = 8
 )
