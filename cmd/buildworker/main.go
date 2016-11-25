@@ -91,7 +91,12 @@ func main() {
 			return
 		}
 
-		// TODO: perform build
+		err = buildworker.Build(w, info.BuildConfig, info.Platform)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	})
 
 	fmt.Println("Build worker serving on", addr)

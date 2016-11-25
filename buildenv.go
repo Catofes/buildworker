@@ -40,7 +40,7 @@ type BuildEnv struct {
 func newBuildEnv(caddyVersion string, plugins []CaddyPlugin) (BuildEnv, error) {
 	be := BuildEnv{
 		Workspace: workspace,
-		Log:       LogBuffer{Writer: os.Stdout}, //LogBuffer{Writer: new(bytes.Buffer)},
+		Log:       LogBuffer{Writer: os.Stdout}, //TODO: LogBuffer{Writer: new(bytes.Buffer)},
 		EnvPath:   os.Getenv("PATH"),
 		BuildCfg: BuildConfig{
 			CaddyVersion: caddyVersion,
@@ -96,32 +96,62 @@ func (be BuildEnv) gitCheckout(repoPath, version string) error {
 	return cmd.Run()
 }
 
+// gitFetch runs `git fetch` in the repoPath dir.
+func (be BuildEnv) gitFetch(repoPath string) error {
+	cmd := be.makeCommand(false, "git", "fetch")
+	cmd.Dir = repoPath
+	return cmd.Run()
+}
+
 // setup runs `go get` and `git checkout` to put caddy and
 // the plugin (if any) in the build environment's GOPATH
 // at the right version, so it's ready for use.
 func (be BuildEnv) setup() error {
-	// go get caddy
-	// TODO: replace these logs with something when we run commands that logs the command being run
-	// TODO: we might be able to just clone caddy and plugin initially with limited depth...
-	// because we checkout a specific version and run go get after that anyway.
-	be.Log.Println("go getting Caddy")
-	err := be.goGet(CaddyPackage)
-	if err != nil {
-		return fmt.Errorf("go get caddy: %v", err)
+	// go get caddy (or copy from master GOPATH for speed)
+	masterGopathCaddy := filepath.Join(masterGopath, "src", CaddyPackage)
+	if dirExists(masterGopathCaddy) && be.Gopath != absoluteMasterGopath {
+		be.Log.Println("copying Caddy repo and fetching")
+		err := deepCopy(masterGopathCaddy, be.CaddyRepoPath(), false, false)
+		if err != nil {
+			return fmt.Errorf("copying caddy: %v", err)
+		}
+		err = be.gitFetch(be.CaddyRepoPath())
+		if err != nil {
+			return fmt.Errorf("git fetch caddy: %v", err)
+		}
+	} else {
+		be.Log.Println("go getting Caddy")
+		err := be.goGet(CaddyPackage)
+		if err != nil {
+			return fmt.Errorf("go get caddy: %v", err)
+		}
 	}
 
-	// go get the plugins
+	// go get the plugins (or copy from master GOPATH for speed)
 	for _, plugin := range be.BuildCfg.Plugins {
-		be.Log.Printf("go getting %s", plugin.Package)
-		err = be.goGet(plugin.Package)
-		if err != nil {
-			return fmt.Errorf("go get plugin: %v", err)
+		masterGopathPlugin := filepath.Join(masterGopath, "src", plugin.Package)
+		if dirExists(masterGopathPlugin) && be.Gopath != absoluteMasterGopath {
+			be.Log.Println("copying plugin repo and fetching", plugin.Package)
+			err := deepCopy(masterGopathPlugin, be.RepoPath(plugin.Package), false, false)
+			if err != nil {
+				return fmt.Errorf("copying plugin: %v", err)
+			}
+			err = be.gitFetch(be.RepoPath(plugin.Package))
+			if err != nil {
+				return fmt.Errorf("git fetch plugin: %v", err)
+			}
+		} else {
+			be.Log.Printf("go getting %s", plugin.Package)
+			err := be.goGet(plugin.Package)
+			if err != nil {
+				return fmt.Errorf("go get plugin: %v", err)
+			}
 		}
 	}
 
 	// checkout the desired version of Caddy
 	be.Log.Println("Checking out version of Caddy")
-	err = be.gitCheckout(be.CaddyRepoPath(), be.BuildCfg.CaddyVersion)
+	err := be.gitCheckout(be.CaddyRepoPath(), be.BuildCfg.CaddyVersion)
 	if err != nil {
 		return fmt.Errorf("checking out caddy: %v", err)
 	}
@@ -179,10 +209,17 @@ func (be BuildEnv) goBuildChecks(pkg string) error {
 	}
 
 	for _, platform := range platforms {
+		cgo := "CGO_ENABLED=0"
+		if platform.OS == "darwin" {
+			// TODO.
+			// As of Go 1.6, darwin might have some trouble if cgo is disabled.
+			// https://www.reddit.com/r/golang/comments/46bd5h/ama_we_are_the_go_contributors_ask_us_anything/d03rmc9
+			cgo = "CGO_ENABLED=1"
+		}
 		log.Printf("GOOS=%s GOARCH=%s GOARM=%s go build", platform.OS, platform.Arch, platform.ARM)
 		cmd := be.makeCommand(true, "go", "build", "-p", strconv.Itoa(ParallelBuildOps), pkg+"/...")
 		for _, env := range []string{
-			"CGO_ENABLED=0",
+			cgo,
 			"GOOS=" + platform.OS,
 			"GOARCH=" + platform.Arch,
 			"GOARM=" + platform.ARM,
@@ -199,6 +236,39 @@ func (be BuildEnv) goBuildChecks(pkg string) error {
 	return nil
 }
 
+// buildCaddy builds caddy using be for the given platform and puts
+// the binary at outputFile. The outputFile path, if relative, will
+// be relative to the folder where Caddy's main() function is defined.
+func (be BuildEnv) buildCaddy(platform Platform, outputFile string) error {
+	ldflags, err := makeLdFlags(be.RepoPath(CaddyPackage))
+	if err != nil {
+		return err
+	}
+	cgo := "CGO_ENABLED=0"
+	if platform.OS == "darwin" {
+		// TODO.
+		// As of Go 1.6, darwin might have some trouble if cgo is disabled.
+		// https://www.reddit.com/r/golang/comments/46bd5h/ama_we_are_the_go_contributors_ask_us_anything/d03rmc9
+		cgo = "CGO_ENABLED=1"
+	}
+	cmd := be.makeCommand(true, "go", "build", "-ldflags", ldflags, "-o", outputFile)
+	cmd.Dir = filepath.Join(be.RepoPath(CaddyPackage), "caddy")
+	for _, env := range []string{
+		cgo,
+		"GOOS=" + platform.OS,
+		"GOARCH=" + platform.Arch,
+		"GOARM=" + platform.ARM,
+	} {
+		cmd.Env = append(cmd.Env, env)
+	}
+	err = cmd.Run()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (be BuildEnv) cleanup() error {
 	if be.Workspace != "" { // only remove temporary GOPATHs
 		return os.RemoveAll(be.Gopath)
@@ -209,7 +279,7 @@ func (be BuildEnv) cleanup() error {
 func (be BuildEnv) makeCommand(withEnvPath bool, command string, args ...string) *exec.Cmd {
 	cmd := exec.Command(command, args...)
 	cmd.Env = []string{
-		"GOPATH=" + be.Gopath,
+		"GOPATH=" + be.Gopath + ":" + absoluteMasterGopath,
 	}
 	if withEnvPath {
 		cmd.Env = append(cmd.Env, "PATH="+be.EnvPath)
@@ -306,6 +376,13 @@ func makeNewGopath(be *BuildEnv) error {
 	}
 	be.Gopath = gopath
 	return nil
+}
+
+func deployedVersion(pkg string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = filepath.Join(masterGopath, "src", pkg)
+	output, err := cmd.Output()
+	return strings.TrimSpace(string(output)), err
 }
 
 const (
