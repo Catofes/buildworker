@@ -5,9 +5,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/caddyserver/buildworker"
 )
@@ -21,9 +24,9 @@ var (
 )
 
 func init() {
-	apiUsername = os.Getenv("BUILDWORKER_USERNAME")
+	apiUsername = os.Getenv("BUILDSERVER_ID")
 	hash := sha1.New()
-	hash.Write([]byte(os.Getenv("BUILDWORKER_PASSWORD")))
+	hash.Write([]byte(os.Getenv("BUILDSERVER_KEY")))
 	apiPassword = hash.Sum(nil)
 }
 
@@ -41,16 +44,25 @@ func main() {
 			return
 		}
 
-		if info.CaddyVersion == "" || info.PluginPackage == "" ||
-			info.PluginVersion == "" || len(info.AllPlugins) == 0 {
-			http.Error(w, "missing required fields", http.StatusBadRequest)
+		if info.CaddyVersion == "" || info.PluginPackage == "" || info.PluginVersion == "" {
+			http.Error(w, "missing required field(s)", http.StatusBadRequest)
 			return
 		}
 
-		err = buildworker.DeployPlugin(info.PluginPackage, info.PluginVersion, info.AllPlugins)
+		be, err := buildworker.Open(info.CaddyVersion, []buildworker.CaddyPlugin{
+			{Package: info.PluginPackage, Version: info.PluginVersion},
+		})
+		if err != nil {
+			log.Printf("setting up deploy environment: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer be.Close()
+
+		err = be.Deploy()
 		if err != nil {
 			log.Printf("deploying plugin: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 	})
@@ -64,15 +76,23 @@ func main() {
 			return
 		}
 
-		if info.CaddyVersion == "" || len(info.AllPlugins) == 0 {
-			http.Error(w, "missing required fields", http.StatusBadRequest)
+		if info.CaddyVersion == "" {
+			http.Error(w, "missing required field", http.StatusBadRequest)
 			return
 		}
 
-		err = buildworker.DeployCaddy(info.CaddyVersion, info.AllPlugins)
+		be, err := buildworker.Open(info.CaddyVersion, nil)
 		if err != nil {
-			log.Printf("deploying plugin: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			log.Printf("setting up deploy environment: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer be.Close()
+
+		err = be.Deploy()
+		if err != nil {
+			log.Printf("deploying caddy: %v", err)
+			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
 	})
@@ -91,7 +111,7 @@ func main() {
 			return
 		}
 
-		err = buildworker.Build(w, info.BuildConfig, info.Platform)
+		err = httpBuild(w, info.BuildConfig.CaddyVersion, info.BuildConfig.Plugins, info.Platform)
 		if err != nil {
 			log.Println(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -101,6 +121,50 @@ func main() {
 
 	fmt.Println("Build worker serving on", addr)
 	http.ListenAndServe(addr, nil)
+}
+
+// httpBuild builds Caddy according to the configuration in cfg
+// and plat, and immediately streams the binary into the response
+// body of w.
+func httpBuild(w http.ResponseWriter, caddyVersion string, plugins []buildworker.CaddyPlugin, plat buildworker.Platform) error {
+	if w == nil {
+		return fmt.Errorf("missing ResponseWriter value")
+	}
+
+	// make a temporary folder where the result of the build will go
+	tmpdir, err := ioutil.TempDir("", "caddy_build_")
+	if err != nil {
+		return fmt.Errorf("error getting temporary directory: %v", err)
+	}
+	defer os.RemoveAll(tmpdir)
+
+	// TODO: This does a deep copy of all plugins including their
+	// testdata folders and test files. We might be able to
+	// add parameters to an alternate Open function so that it can be configured
+	// to only copy certain things if we want it to...
+	be, err := buildworker.Open(caddyVersion, plugins)
+	if err != nil {
+		return fmt.Errorf("creating build env: %v", err)
+	}
+	defer be.Close()
+
+	outputFile, err := be.Build(plat, tmpdir)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	name := filepath.Base(outputFile.Name())
+
+	// Write the file to the response, so we can delete it when
+	// the function returns and cleans up its temporary GOPATH.
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	_, err = io.Copy(w, outputFile)
+	if err != nil {
+		return fmt.Errorf("copying archive file: %v", err)
+	}
+
+	return nil
 }
 
 func methodHandler(method string, h http.HandlerFunc) http.HandlerFunc {
@@ -153,10 +217,9 @@ type BuildRequest struct {
 }
 
 type DeployRequest struct {
-	CaddyVersion  string                    `json:"caddy_version"`
-	PluginPackage string                    `json:"plugin_package"`
-	PluginVersion string                    `json:"plugin_version"`
-	AllPlugins    []buildworker.CaddyPlugin `json:"all_plugins"`
+	CaddyVersion  string `json:"caddy_version"`
+	PluginPackage string `json:"plugin_package"`
+	PluginVersion string `json:"plugin_version"`
 }
 
 const (

@@ -3,55 +3,39 @@ package buildworker
 import (
 	"fmt"
 	"io"
-	"log"
-	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/mholt/archiver"
 )
 
-func init() {
-	var err error
-	absoluteMasterGopath, err = filepath.Abs(masterGopath)
-	if err != nil {
-		log.Fatal(err)
+// TODO: Maintain master gopath (when? master gopaths are
+// scoped to individual BuildEnvs) by pruning unused packages...
+
+var gopathLocks = make(map[string]*sync.RWMutex)
+
+func lock(gopath string) {
+	if _, ok := gopathLocks[gopath]; !ok {
+		gopathLocks[gopath] = new(sync.RWMutex)
 	}
+	gopathLocks[gopath].Lock()
 }
 
-// A Workspace is a folder path which will hold one or more GOPATHs.
-type Workspace string
-
-// workspace is where we do concurrent builds and tests.
-const workspace = Workspace("./workspace")
-
-// masterGopath is where we store our master copy of repos.
-const masterGopath = "./gopath"
-
-// masterGopathMu protects the masterGopath from concurrent writes.
-var masterGopathMu sync.RWMutex
-
-// absoluteMasterGopath is the absolute form of masterGopath.
-var absoluteMasterGopath string
-
-type LogBuffer struct{ io.Writer }
-
-const logTimeFormat = "2006/01/02 15:04:05"
-
-func (b LogBuffer) Println(a ...interface{}) {
-	fmt.Fprintf(b, "%s ", time.Now().Format(logTimeFormat))
-	fmt.Fprintln(b, a...)
+func unlock(gopath string) {
+	gopathLocks[gopath].Unlock()
 }
 
-func (b LogBuffer) Printf(format string, a ...interface{}) {
-	fmt.Fprintf(b, "%s ", time.Now().Format(logTimeFormat))
-	fmt.Fprintf(b, format, a...)
-	if !strings.HasSuffix(format, "\n") {
-		fmt.Fprintln(b)
+func rlock(gopath string) {
+	if _, ok := gopathLocks[gopath]; !ok {
+		gopathLocks[gopath] = new(sync.RWMutex)
 	}
+	gopathLocks[gopath].RLock()
+}
+
+func runlock(gopath string) {
+	gopathLocks[gopath].RUnlock()
 }
 
 // CaddyPlugin holds information about a Caddy plugin to build.
@@ -68,257 +52,94 @@ type BuildConfig struct {
 	Plugins      []CaddyPlugin `json:"plugins"`
 }
 
-func Build(w http.ResponseWriter, cfg BuildConfig, plat Platform) error {
-	if w == nil || plat.OS == "" || plat.Arch == "" {
-		return fmt.Errorf("missing required information: response writer, OS, or arch")
-	}
+const ldFlagVarPkg = "github.com/mholt/caddy/caddy/caddymain"
 
-	masterGopathMu.RLock()
-	defer masterGopathMu.RUnlock()
-
-	be, err := newBuildEnv(cfg.CaddyVersion, cfg.Plugins)
-	if err != nil {
-		return fmt.Errorf("creating build env: %v", err)
-	}
-	defer be.cleanup()
-
-	// TODO: This does a deep copy of all plugins including their .git
-	// folders and testdata folders and test files. We might be able to
-	// add parameters to this setup function so that it can be configured
-	// to only copy certain things if we want it to...
-	err = be.setup()
-	if err != nil {
-		return fmt.Errorf("setting up build env: %v", err)
-	}
-
-	for _, plugin := range cfg.Plugins {
-		err := be.plugInThePlugin(plugin)
-		if err != nil {
-			return fmt.Errorf("plugging in %s: %v", plugin.Package, err)
+// makeLdFlags makes a string to pass in as ldflags when building Caddy.
+// This automates proper versioning, so it uses git to get information
+// about the current version of Caddy.
+func makeLdFlags(repoPath string) (string, error) {
+	run := func(cmd *exec.Cmd, ignoreError bool) (string, error) {
+		cmd.Dir = repoPath
+		out, err := cmd.Output()
+		if err != nil && !ignoreError {
+			return string(out), err
 		}
+		return strings.TrimSpace(string(out)), nil
 	}
 
-	caddyVer := be.BuildCfg.CaddyVersion
-	if !strings.HasPrefix(caddyVer, "v") && len(caddyVer) > 8 {
-		caddyVer = caddyVer[:8]
-	}
-	outputName := "caddy_" + plat.OS + "_" + plat.Arch
-	if plat.Arch == "arm" {
-		outputName += plat.ARM
-	}
-	outputName += "_" + caddyVer + "_custom"
+	var ldflags []string
 
-	binaryOutputName := outputName
-	if plat.OS == "windows" {
-		binaryOutputName += ".exe"
-	}
-
-	err = be.buildCaddy(plat, binaryOutputName)
-	if err != nil {
-		return fmt.Errorf("building caddy: %v", err)
-	}
-
-	// by default, we'll use a .tar.gz archive, but for
-	// some OSes, .zip is more regular.
-	compressZip := plat.OS == "windows" || plat.OS == "darwin"
-
-	fileList := []string{
-		filepath.Join(be.CaddyRepoPath(), "dist", "README.txt"),
-		filepath.Join(be.CaddyRepoPath(), "dist", "LICENSES.txt"),
-		filepath.Join(be.CaddyRepoPath(), "dist", "CHANGES.txt"),
-		filepath.Join(be.CaddyRepoPath(), "dist", "init"),
-		filepath.Join(be.CaddyRepoPath(), "caddy", binaryOutputName),
-	}
-
-	finalOutputName := filepath.Join(be.CaddyRepoPath(), "dist", outputName)
-
-	if compressZip {
-		finalOutputName += ".zip"
-		err = archiver.Zip.Make(finalOutputName, fileList)
-	} else {
-		finalOutputName += ".tar.gz"
-		err = archiver.TarGz.Make(finalOutputName, fileList)
-	}
-	if err != nil {
-		return fmt.Errorf("error compressing: %v", err)
-	}
-
-	// Write the file to the response, so we can delete it when
-	// the function returns and cleans up its temporary GOPATH.
-	w.Header().Set("Content-Disposition", `attachment; filename="`+finalOutputName+`"`)
-	file, err := os.Open(finalOutputName)
-	if err != nil {
-		return fmt.Errorf("opening archive file: %v", err)
-	}
-	defer file.Close()
-	_, err = io.Copy(w, file)
-	if err != nil {
-		return fmt.Errorf("copying archive file: %v", err)
-	}
-
-	return nil
-}
-
-// DeployCaddy begins the pipeline that deploys
-// an update to the main Caddy repo.
-func DeployCaddy(version string, allPlugins []CaddyPlugin) error {
-	be, err := newBuildEnv(version, nil)
-	if err != nil {
-		return err
-	}
-	defer be.cleanup()
-
-	err = be.setup()
-	if err != nil {
-		return err
-	}
-
-	deployEnv := BuildEnv{
-		Log:     be.Log,
-		EnvPath: be.EnvPath,
-		Gopath:  absoluteMasterGopath,
-		BuildCfg: BuildConfig{
-			CaddyVersion: version,
-			Plugins:      allPlugins,
+	for _, ldvar := range []struct {
+		name  string
+		value func() (string, error)
+	}{
+		// Timestamp of build
+		{
+			name: "buildDate",
+			value: func() (string, error) {
+				return time.Now().UTC().Format("Mon Jan 02 15:04:05 MST 2006"), nil
+			},
 		},
-	}
 
-	return deploy(CaddyPackage, deployEnv)
-}
-
-// DeployPlugin begins the pipeline that deploys a new plugin.
-// It blocks until the plugin is finished deploying, or an error
-// occurs.
-func DeployPlugin(pkg, version string, allPlugins []CaddyPlugin) error {
-	be, err := newBuildEnv("master", []CaddyPlugin{ // TODO: which version is currently deployed...?
-		{Package: pkg, Version: version}, // TODO: repo URL?
-	})
-	if err != nil {
-		return err
-	}
-	defer be.cleanup()
-
-	err = checkPlugin(be)
-	if err != nil {
-		return err
-	}
-
-	deployEnv := BuildEnv{
-		Log:     be.Log,
-		EnvPath: be.EnvPath,
-		Gopath:  absoluteMasterGopath,
-		BuildCfg: BuildConfig{
-			CaddyVersion: be.BuildCfg.CaddyVersion,
-			Plugins:      allPlugins,
+		// Current tag, if HEAD is on a tag
+		{
+			name: "gitTag",
+			value: func() (string, error) {
+				// OK to ignore error since HEAD may not be at a tag
+				return run(exec.Command("git", "describe", "--exact-match", "HEAD"), true)
+			},
 		},
+
+		// Nearest tag on branch
+		{
+			name: "gitNearestTag",
+			value: func() (string, error) {
+				return run(exec.Command("git", "describe", "--abbrev=0", "--tags", "HEAD"), false)
+			},
+		},
+
+		// Commit SHA
+		{
+			name: "gitCommit",
+			value: func() (string, error) {
+				return run(exec.Command("git", "rev-parse", "--short", "HEAD"), false)
+			},
+		},
+
+		// Summary of uncommitted changes
+		{
+			name: "gitShortStat",
+			value: func() (string, error) {
+				return run(exec.Command("git", "diff-index", "--shortstat", "HEAD"), false)
+			},
+		},
+
+		// List of modified files
+		{
+			name: "gitFilesModified",
+			value: func() (string, error) {
+				return run(exec.Command("git", "diff-index", "--name-only", "HEAD"), false)
+			},
+		},
+	} {
+		value, err := ldvar.value()
+		if err != nil {
+			return "", err
+		}
+		ldflags = append(ldflags, fmt.Sprintf(`-X "%s.%s=%s"`, ldFlagVarPkg, ldvar.name, value))
 	}
 
-	return deploy(pkg, deployEnv)
+	return strings.Join(ldflags, " "), nil
 }
 
+// dirExists returns true if dir exists and is a
+// directory, or false in any other case.
 func dirExists(dir string) bool {
 	info, err := os.Stat(dir)
 	if err != nil {
 		return !os.IsNotExist(err)
 	}
 	return info.IsDir()
-}
-
-func deploy(pkg string, deployEnv BuildEnv) error {
-	masterGopathMu.Lock()
-	defer masterGopathMu.Unlock()
-
-	// reset all plugins to their tip so `go get -u` will succeed
-	for _, plugin := range deployEnv.BuildCfg.Plugins {
-		pluginRepo := deployEnv.RepoPath(plugin.Package)
-		if dirExists(pluginRepo) {
-			err := deployEnv.gitCheckout(pluginRepo, "-")
-			if err != nil {
-				return fmt.Errorf("resetting git checkout: %v", err)
-			}
-		}
-	}
-
-	// run `go get -u` to get the latest into the master GOPATH.
-	cmd := deployEnv.makeCommand(true, "go", "get", "-u", "-d", "-x", pkg+"/...")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("go get into deploy env: %v", err)
-	}
-
-	// the `go get -u` we just ran might have overwritten the versions
-	// of any plugins we had checked out; running 'setup' should be
-	// able to restore them to the versions we intend to use because
-	// it does not use the -u flag when running `go get`.
-	err = deployEnv.setup()
-	if err != nil {
-		return fmt.Errorf("restoring deploy env: %v", err)
-	}
-
-	return nil
-}
-
-func CheckPlugin(pkg, version string) error {
-	be, err := newBuildEnv("master", []CaddyPlugin{ // TODO: latest caddy version...?
-		{Package: pkg, Version: version}, // TODO: repo URL?
-	})
-	if err != nil {
-		return err
-	}
-	defer be.cleanup()
-	return checkPlugin(be)
-}
-
-func checkPlugin(be BuildEnv) error {
-	err := be.setup()
-	if err != nil {
-		return err
-	}
-
-	// go vet the plugin
-	be.Log.Println("go vet the plugins")
-	for _, plugin := range be.BuildCfg.Plugins {
-		err = be.goVet(plugin.Package)
-		if err != nil {
-			return fmt.Errorf("go vet plugin: %v", err)
-		}
-	}
-
-	// go test the plugin
-	be.Log.Println("go test the plugins")
-	for _, plugin := range be.BuildCfg.Plugins {
-		err = be.goTest(plugin.Package)
-		if err != nil {
-			return fmt.Errorf("go test plugin: %v", err)
-		}
-	}
-
-	// plug in the plugin
-	be.Log.Println("Plugging in the plugins")
-	for _, plugin := range be.BuildCfg.Plugins {
-		err = be.plugInThePlugin(plugin)
-		if err != nil {
-			return fmt.Errorf("plugging in plugin: %v", err)
-		}
-	}
-
-	// go test Caddy with the plugin installed
-	be.Log.Println("go test Caddy with plugin installed")
-	err = be.goTest(CaddyPackage)
-	if err != nil {
-		return fmt.Errorf("go test caddy with plugin: %v", err)
-	}
-
-	// go build on various platforms
-	be.Log.Println("go build checks")
-	for _, plugin := range be.BuildCfg.Plugins {
-		err = be.goBuildChecks(plugin.Package)
-		if err != nil {
-			return fmt.Errorf("go build: %v", err)
-		}
-	}
-
-	return nil
 }
 
 // deepCopy makes a deep file copy of src into dest, overwriting any existing files.
