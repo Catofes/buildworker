@@ -62,7 +62,7 @@ func main() {
 		err = be.Deploy()
 		if err != nil {
 			log.Printf("deploying plugin: %v", err)
-			http.Error(w, err.Error(), http.StatusConflict)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 	})

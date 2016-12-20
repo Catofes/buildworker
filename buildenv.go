@@ -95,18 +95,26 @@ func (be BuildEnv) provision() error {
 	// and run `git fetch` to ensure we can checkout any version,
 	// then checkout that version in the temporary GOPATH.
 	for pkg, version := range be.pkgs {
-		err := deepCopy(be.Path(pkg), be.TemporaryPath(pkg), false, false)
+		// use RepoPath (and TemporaryRepoPath) to ensure we copy the
+		// entire git repository so we can run git commands within them
+		srcRepoPath := be.RepoPath(pkg)
+		destRepoPath := be.TemporaryRepoPath(srcRepoPath)
+
+		err := deepCopy(srcRepoPath, destRepoPath, false, false, true)
 		if err != nil {
 			return fmt.Errorf("copying %s: %v", pkg, err)
 		}
+
 		err = be.gitFetch(be.TemporaryPath(pkg))
 		if err != nil {
 			return fmt.Errorf("git fetch %s: %v", pkg, err)
 		}
+
 		err = be.gitCheckout(be.TemporaryPath(pkg), version)
 		if err != nil {
 			return fmt.Errorf("git checkout %s @ %s: %v", pkg, version, err)
 		}
+
 		// run `go get` since the version we just checked out
 		// might have previously-unseen dependencies
 		err = be.goGet(pkg)
@@ -212,6 +220,30 @@ func (be BuildEnv) TemporaryPath(pkg string) string {
 // master GOPATH.
 func (be BuildEnv) Path(pkg string) string {
 	return filepath.Join(be.masterGopath, "src", pkg)
+}
+
+// TemporaryRepoPath returns the temporary equivalent
+// of the repository path repoPath as if repoPath was
+// in the temporary GOPATH. Obtain the repoPath argument
+// by calling be.RepoPath().
+func (be BuildEnv) TemporaryRepoPath(repoPath string) string {
+	prefix := filepath.Join(be.masterGopath, "src") + string(filepath.Separator)
+	base := strings.TrimPrefix(repoPath, prefix)
+	return be.TemporaryPath(base)
+}
+
+// RepoPath returns the path to pkg's repository's
+// top-level folder (where the .git folder is) as
+// found in the master GOPATH. It requires some
+// file system traversal.
+func (be BuildEnv) RepoPath(pkg string) string {
+	fp := be.Path(pkg)
+	var prevFp string
+	for !dirExists(filepath.Join(fp, ".git")) && fp != prevFp {
+		prevFp = fp
+		fp = filepath.Dir(fp)
+	}
+	return fp
 }
 
 // newTemporaryGopath creates a new gopath folder
@@ -329,7 +361,7 @@ func (be BuildEnv) backupMasterGopath() (string, error) {
 	if err != nil {
 		return tmpdir, err
 	}
-	err = deepCopy(be.masterGopath, tmpdir, false, false)
+	err = deepCopy(be.masterGopath, tmpdir, false, false, true)
 	if err != nil {
 		os.RemoveAll(tmpdir)
 	}
@@ -357,7 +389,7 @@ func (be BuildEnv) restoreMasterGopath(tmpdir string) error {
 	}
 
 	// copy the files back over
-	err = deepCopy(tmpdir, be.masterGopath, false, false)
+	err = deepCopy(tmpdir, be.masterGopath, false, false, true)
 	if err != nil {
 		return err
 	}

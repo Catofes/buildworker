@@ -146,8 +146,9 @@ func dirExists(dir string) bool {
 // If an error occurs, not all files were copied successfully. This function blocks.
 // If skipHidden is true, files and folders with names beginning with "." are skipped.
 // If skipTestFiles is true, files ending with "_test.go" and folders named "testdata"
-// are skipped.
-func deepCopy(src string, dest string, skipHidden, skipTestFiles bool) error {
+// are skipped. If skipSymlinks is true, symbolic links will not be evaluated and will
+// be skipped.
+func deepCopy(src string, dest string, skipHidden, skipTestFiles, skipSymlinks bool) error {
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		// error accessing current file
 		if err != nil {
@@ -159,6 +160,11 @@ func deepCopy(src string, dest string, skipHidden, skipTestFiles bool) error {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+
+		// skip symlinks, if requested
+		if skipSymlinks && (info.Mode()&os.ModeSymlink > 0) {
 			return nil
 		}
 
