@@ -1,6 +1,7 @@
 package buildworker
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +10,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/openpgp"
 )
+
+var Signer *openpgp.Entity
 
 // TODO: Maintain master gopath (when? master gopaths are
 // scoped to individual BuildEnvs) by pruning unused packages...
@@ -229,4 +234,33 @@ func deepCopy(src string, dest string, skipHidden, skipTestFiles, skipSymlinks b
 		}
 		return nil
 	})
+}
+
+// DeployRequest represents a request to test an updated
+// version of a plugin against a specific Caddy version.
+type DeployRequest struct {
+	// The version of Caddy into which to plug in.
+	CaddyVersion string `json:"caddy_version"`
+
+	// The import, or package path, of the plugin, and its version
+	PluginPackage string `json:"plugin_package"`
+	PluginVersion string `json:"plugin_version"`
+
+	// The list of platforms on which the plugin must
+	// build successfully.
+	RequiredPlatforms []Platform `json:"required_platforms"`
+}
+
+// Sign signs the file using the configured PGP private key
+// and returns the ASCII-armored bytes, or an error.
+func Sign(file *os.File) (*bytes.Buffer, error) {
+	if Signer == nil {
+		return nil, fmt.Errorf("no signing key loaded")
+	}
+	buf := new(bytes.Buffer)
+	err := openpgp.ArmoredDetachSign(buf, Signer, file, nil)
+	if err != nil {
+		return nil, fmt.Errorf("signing error: %v", err)
+	}
+	return buf, nil
 }

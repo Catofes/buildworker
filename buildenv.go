@@ -33,23 +33,27 @@ type BuildEnv struct {
 	masterGopath string
 	tmpGopath    string
 	pkgs         map[string]string // map of package to version
-	Log          *log.Logger
+	log          *log.Logger
+	Log          *bytes.Buffer
 }
 
 // Open creates a new, provisioned build environment with caddy
 // and the specified plugins at their associated versions. It
 // uses the master GOPATH (from environment) to provision itself
-// efficiently.
+// efficiently. If this function returns without error, you must
+// close the build environment when you are done.
 func Open(caddyVersion string, plugins []CaddyPlugin) (BuildEnv, error) {
 	tmpGopath, err := newTemporaryGopath()
 	if err != nil {
 		return BuildEnv{}, err
 	}
+	logBuf := new(bytes.Buffer)
 	be := BuildEnv{
 		masterGopath: os.Getenv("GOPATH"),
 		tmpGopath:    tmpGopath,
 		pkgs:         make(map[string]string),
-		Log:          log.New(os.Stdout, "", log.Ldate|log.Ltime), // TODO: new(bytes.Buffer) or something, instead of os.Stdout
+		Log:          logBuf,
+		log:          log.New(logBuf, "", log.Ldate|log.Ltime),
 	}
 	for _, plugin := range plugins {
 		be.pkgs[plugin.Package] = plugin.Version
@@ -277,14 +281,14 @@ func (be BuildEnv) newCommand(command string, args ...string) *exec.Cmd {
 		"PATH=" + os.Getenv("PATH"),
 		"TMPDIR=" + os.Getenv("TMPDIR"),
 	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = be.Log
+	cmd.Stderr = be.Log
 	return cmd
 }
 
 // runCommand runs cmd while logging the command being run.
 func (be BuildEnv) runCommand(cmd *exec.Cmd) error {
-	be.Log.Printf("exec [%s] %s %s\n", cmd.Dir, cmd.Path, strings.Join(cmd.Args[1:], " "))
+	be.log.Printf("exec [%s] %s %s\n", cmd.Dir, cmd.Path, strings.Join(cmd.Args[1:], " "))
 	return cmd.Run()
 }
 
@@ -455,7 +459,7 @@ func (be BuildEnv) UpdateMasterGopath() error {
 	setEnvGopath(cmd.Env, be.masterGopath) // operate on master GOPATH only
 	lock(be.masterGopath)
 	defer unlock(be.masterGopath)
-	be.Log.Println("Updating master GOPATH: %s", be.masterGopath)
+	be.log.Printf("Updating master GOPATH: %s", be.masterGopath)
 	return be.runCommand(cmd)
 }
 
@@ -492,7 +496,7 @@ func (be BuildEnv) RunPluginChecks() (bool, error) {
 		// TODO: This does not unplug any previously-plugged-in
 		// plugins, but that's okay since we only deploy one
 		// plugin at a time, right?
-		be.Log.Printf("plugging in %s", pkg)
+		be.log.Printf("plugging in %s", pkg)
 		err = be.plugInThePlugin(pkg)
 		if err != nil {
 			return false, fmt.Errorf("plugging in %s: %v", pkg, err)

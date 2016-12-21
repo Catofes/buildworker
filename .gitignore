@@ -1,1 +1,3 @@
 _gitignore/
+private_key.asc
+private_key_password.txt

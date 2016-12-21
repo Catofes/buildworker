@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/json"
@@ -8,26 +9,21 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/crypto/openpgp"
 
 	"github.com/caddyserver/buildworker"
 )
 
 var addr = "127.0.0.1:2017"
 
-// Credentials for accessing the API
-var (
-	apiUsername string
-	apiPassword []byte // hashed
-)
-
 func init() {
-	apiUsername = os.Getenv("BUILDSERVER_ID")
-	hash := sha1.New()
-	hash.Write([]byte(os.Getenv("BUILDSERVER_KEY")))
-	apiPassword = hash.Sum(nil)
+	setAPICredentials()
+	setSigningKey()
 }
 
 func main() {
@@ -35,8 +31,42 @@ func main() {
 		http.HandleFunc(path, methodHandler(method, maxSizeHandler(authHandler(h))))
 	}
 
+	addRoute("POST", "/deploy-caddy", func(w http.ResponseWriter, r *http.Request) {
+		var info buildworker.DeployRequest
+		err := json.NewDecoder(r.Body).Decode(&info)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if info.CaddyVersion == "" {
+			http.Error(w, "missing required field", http.StatusBadRequest)
+			return
+		}
+
+		be, err := buildworker.Open(info.CaddyVersion, nil)
+		if err != nil {
+			log.Printf("setting up deploy environment: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
+			return
+		}
+		defer be.Close()
+
+		err = be.Deploy()
+		if err != nil {
+			log.Printf("deploying Caddy: %v", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
+			return
+		}
+	})
+
 	addRoute("POST", "/deploy-plugin", func(w http.ResponseWriter, r *http.Request) {
-		var info DeployRequest
+		var info buildworker.DeployRequest
 		err := json.NewDecoder(r.Body).Decode(&info)
 		if err != nil {
 			log.Println(err)
@@ -54,7 +84,9 @@ func main() {
 		})
 		if err != nil {
 			log.Printf("setting up deploy environment: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
 			return
 		}
 		defer be.Close()
@@ -62,37 +94,9 @@ func main() {
 		err = be.Deploy()
 		if err != nil {
 			log.Printf("deploying plugin: %v", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	})
-
-	addRoute("POST", "/deploy-caddy", func(w http.ResponseWriter, r *http.Request) {
-		var info DeployRequest
-		err := json.NewDecoder(r.Body).Decode(&info)
-		if err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		if info.CaddyVersion == "" {
-			http.Error(w, "missing required field", http.StatusBadRequest)
-			return
-		}
-
-		be, err := buildworker.Open(info.CaddyVersion, nil)
-		if err != nil {
-			log.Printf("setting up deploy environment: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer be.Close()
-
-		err = be.Deploy()
-		if err != nil {
-			log.Printf("deploying caddy: %v", err)
-			http.Error(w, err.Error(), http.StatusConflict)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
 			return
 		}
 	})
@@ -111,30 +115,40 @@ func main() {
 			return
 		}
 
-		err = httpBuild(w, info.BuildConfig.CaddyVersion, info.BuildConfig.Plugins, info.Platform)
+		httpBuild(w, info.BuildConfig.CaddyVersion, info.BuildConfig.Plugins, info.Platform)
+	})
+
+	addRoute("GET", "/supported-platforms", func(w http.ResponseWriter, r *http.Request) {
+		sup, err := buildworker.SupportedPlatforms(buildworker.UnsupportedPlatforms)
 		if err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+		json.NewEncoder(w).Encode(sup)
 	})
 
 	fmt.Println("Build worker serving on", addr)
 	http.ListenAndServe(addr, nil)
 }
 
+type Error struct {
+	Message string
+	Log     string
+}
+
 // httpBuild builds Caddy according to the configuration in cfg
 // and plat, and immediately streams the binary into the response
 // body of w.
-func httpBuild(w http.ResponseWriter, caddyVersion string, plugins []buildworker.CaddyPlugin, plat buildworker.Platform) error {
-	if w == nil {
-		return fmt.Errorf("missing ResponseWriter value")
+func httpBuild(w http.ResponseWriter, caddyVersion string, plugins []buildworker.CaddyPlugin, plat buildworker.Platform) {
+	internalErr := func(intro string, err error) {
+		log.Printf("%s: %v", intro, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
 
 	// make a temporary folder where the result of the build will go
 	tmpdir, err := ioutil.TempDir("", "caddy_build_")
 	if err != nil {
-		return fmt.Errorf("error getting temporary directory: %v", err)
+		internalErr("error getting temporary directory", err)
+		return
 	}
 	defer os.RemoveAll(tmpdir)
 
@@ -144,27 +158,67 @@ func httpBuild(w http.ResponseWriter, caddyVersion string, plugins []buildworker
 	// to only copy certain things if we want it to...
 	be, err := buildworker.Open(caddyVersion, plugins)
 	if err != nil {
-		return fmt.Errorf("creating build env: %v", err)
+		log.Printf("creating build env: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
+		return
 	}
 	defer be.Close()
 
 	outputFile, err := be.Build(plat, tmpdir)
 	if err != nil {
-		return err
+		log.Printf("build: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(Error{Message: err.Error(), Log: be.Log.String()})
+		return
 	}
 	defer outputFile.Close()
-
 	name := filepath.Base(outputFile.Name())
 
-	// Write the file to the response, so we can delete it when
-	// the function returns and cleans up its temporary GOPATH.
-	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
-	_, err = io.Copy(w, outputFile)
+	signatureBuf, err := buildworker.Sign(outputFile)
 	if err != nil {
-		return fmt.Errorf("copying archive file: %v", err)
+		internalErr("signing archive", err)
+		return
+	}
+	signatureName := name + ".asc"
+
+	_, err = outputFile.Seek(0, 0)
+	if err != nil {
+		internalErr("seeking to beginning of file", err)
+		return
 	}
 
-	return nil
+	writer := multipart.NewWriter(w)
+	w.Header().Set("Content-Type", writer.FormDataContentType())
+	part, err := writer.CreateFormFile("signature", signatureName)
+	if err != nil {
+		internalErr("creating signature form file", err)
+		return
+	}
+	_, err = io.Copy(part, signatureBuf)
+	if err != nil {
+		internalErr("copying signature into form", err)
+		return
+	}
+	part, err = writer.CreateFormFile("archive", name)
+	if err != nil {
+		internalErr("creating archive form file", err)
+		return
+	}
+	_, err = io.Copy(part, outputFile)
+	if err != nil {
+		internalErr("copying archive into form", err)
+		return
+	}
+	err = writer.Close()
+	if err != nil {
+		internalErr("closing form writer", err)
+		return
+	}
+
+	return
 }
 
 func methodHandler(method string, h http.HandlerFunc) http.HandlerFunc {
@@ -211,18 +265,81 @@ func correctPassword(pwd string) bool {
 	return subtle.ConstantTimeCompare(sum, apiPassword) == 1
 }
 
+func setAPICredentials() {
+	apiUsername = os.Getenv("BUILDSERVER_ID")
+	hash := sha1.New()
+	hash.Write([]byte(os.Getenv("BUILDSERVER_KEY")))
+	apiPassword = hash.Sum(nil)
+}
+
+func setSigningKey() {
+	signingKeyFile := defaultSigningKeyFile
+	keyPasswordFile := defaultKeyPasswordFile
+
+	if custom := os.Getenv("SIGNING_KEY_FILE"); custom != "" {
+		signingKeyFile = custom
+	}
+	if custom := os.Getenv("KEY_PASSWORD_FILE"); custom != "" {
+		keyPasswordFile = custom
+	}
+
+	// open key file
+	privKeyFile, err := os.Open(signingKeyFile)
+	if err != nil {
+		if os.IsNotExist(err) && signingKeyFile == defaultKeyPasswordFile {
+			return // no signing enabled, but not a problem
+		}
+		log.Fatalf("unable to load signing key file: %v", err)
+	}
+
+	// read key file
+	entities, err := openpgp.ReadArmoredKeyRing(privKeyFile)
+	if err != nil {
+		log.Fatalf("reading key file: %v", err)
+	}
+	if len(entities) < 1 {
+		log.Fatal("no entities loaded")
+	}
+	buildworker.Signer = entities[0]
+
+	if buildworker.Signer.PrivateKey.Encrypted {
+		// open and read password file; trim any edge whitespace
+		passBytes, err := ioutil.ReadFile(keyPasswordFile)
+		if err != nil {
+			log.Fatalf("unable to load key password file: %v", err)
+		}
+		passphrase := bytes.TrimSpace(passBytes)
+
+		// decrypt private key
+		err = buildworker.Signer.PrivateKey.Decrypt(passphrase)
+		if err != nil {
+			log.Fatalf("decrypting private key: %v", err)
+		}
+	}
+}
+
+// BuildRequest is a request for a build of Caddy.
 type BuildRequest struct {
 	buildworker.Platform
 	buildworker.BuildConfig
 }
 
-type DeployRequest struct {
-	CaddyVersion  string `json:"caddy_version"`
-	PluginPackage string `json:"plugin_package"`
-	PluginVersion string `json:"plugin_version"`
-}
-
 const (
+	// The maximum query string length allowed by requests.
 	MaxQueryStringLength = 1024 * 100
-	MaxBodyBytes         = 1024 * 1024 * 10
+
+	// The maximum size allowed for request bodies.
+	MaxBodyBytes = 1024 * 1024 * 10
+)
+
+// Credentials for accessing the API
+var (
+	apiUsername string
+	apiPassword []byte // hashed
+)
+
+// Key for signing binaries/archives
+const (
+	defaultSigningKeyFile  = "private_key.asc"
+	defaultKeyPasswordFile = "private_key_password.txt"
 )
