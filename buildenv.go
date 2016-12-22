@@ -806,8 +806,8 @@ const (
 	// to perform in parallel (`go build -p` value).
 	ParallelBuildOps = 4
 
-	CaddyPackage = "github.com/mholt/caddy"
 	// CaddyPackage is the import (package) path to Caddy.
+	CaddyPackage = "github.com/mholt/caddy"
 
 	// plugInto is the file in which plugins get plugged in
 	plugInto = "caddy/caddymain/run.go"
