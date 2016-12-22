@@ -55,7 +55,7 @@ func main() {
 		}
 		defer be.Close()
 
-		err = be.Deploy()
+		err = be.Deploy(nil) // no required platforms since checks should have already been performed
 		if err != nil {
 			log.Printf("deploying Caddy: %v", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -91,7 +91,7 @@ func main() {
 		}
 		defer be.Close()
 
-		err = be.Deploy()
+		err = be.Deploy(info.RequiredPlatforms)
 		if err != nil {
 			log.Printf("deploying plugin: %v", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -102,7 +102,7 @@ func main() {
 	})
 
 	addRoute("POST", "/build", func(w http.ResponseWriter, r *http.Request) {
-		var info BuildRequest
+		var info buildworker.BuildRequest
 		err := json.NewDecoder(r.Body).Decode(&info)
 		if err != nil {
 			log.Println(err)
@@ -128,11 +128,6 @@ func main() {
 
 	fmt.Println("Build worker serving on", addr)
 	http.ListenAndServe(addr, nil)
-}
-
-type Error struct {
-	Message string
-	Log     string
 }
 
 // httpBuild builds Caddy according to the configuration in cfg
@@ -318,18 +313,21 @@ func setSigningKey() {
 	}
 }
 
-// BuildRequest is a request for a build of Caddy.
-type BuildRequest struct {
-	buildworker.Platform
-	buildworker.BuildConfig
+// Error is a structured way to return an error
+// message along with a detailed log.
+type Error struct {
+	Message string
+	Log     string
 }
 
 const (
-	// The maximum query string length allowed by requests.
-	MaxQueryStringLength = 1024 * 100
+	// MaxQueryStringLength is the maximum query string
+	// length allowed by requests.
+	MaxQueryStringLength = 100 * 1024
 
-	// The maximum size allowed for request bodies.
-	MaxBodyBytes = 1024 * 1024 * 10
+	// MaxBodyBytes is the maximum size allowed for
+	// request bodies.
+	MaxBodyBytes = 10 * 1024 * 1024
 )
 
 // Credentials for accessing the API

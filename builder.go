@@ -14,6 +14,8 @@ import (
 	"golang.org/x/crypto/openpgp"
 )
 
+// Signer is the entity which can sign builds.
+// Its private key must be decrypted.
 var Signer *openpgp.Entity
 
 // TODO: Maintain master gopath (when? master gopaths are
@@ -45,9 +47,11 @@ func runlock(gopath string) {
 
 // CaddyPlugin holds information about a Caddy plugin to build.
 type CaddyPlugin struct {
-	Repo    string `json:"repo"`    // git clone URL -- TODO: used?
 	Package string `json:"package"` // fully qualified package import path
 	Version string `json:"version"` // commit, tag, or branch to checkout
+	Repo    string `json:"repo"`    // git clone URL -- TODO: used?
+	Name    string `json:"-"`       // name of plugin: not used here, but used by devportal
+	ID      string `json:"-"`       // ID of plugin: not used here, but used by devportal
 }
 
 // BuildConfig holds information to conduct a build of some
@@ -204,11 +208,13 @@ func deepCopy(src string, dest string, skipHidden, skipTestFiles, skipSymlinks b
 			return err
 		}
 
-		// open destination file
 		destpath := filepath.Join(dest, strings.TrimPrefix(path, src))
 		fdest, err := os.OpenFile(destpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode()&os.ModePerm)
 		if err != nil {
 			fsrc.Close()
+			if _, err := os.Stat(destpath); err == nil {
+				return fmt.Errorf("opening destination (which already exists): %v", err)
+			}
 			return err
 		}
 
@@ -232,6 +238,7 @@ func deepCopy(src string, dest string, skipHidden, skipTestFiles, skipSymlinks b
 		if err = fdest.Close(); err != nil {
 			return err
 		}
+
 		return nil
 	})
 }
@@ -242,13 +249,19 @@ type DeployRequest struct {
 	// The version of Caddy into which to plug in.
 	CaddyVersion string `json:"caddy_version"`
 
-	// The import, or package path, of the plugin, and its version
+	// The import (package) path of the plugin, and its version.
 	PluginPackage string `json:"plugin_package"`
 	PluginVersion string `json:"plugin_version"`
 
-	// The list of platforms on which the plugin must
+	// The list of platforms on which the plugin(s) must
 	// build successfully.
 	RequiredPlatforms []Platform `json:"required_platforms"`
+}
+
+// BuildRequest is a request for a build of Caddy.
+type BuildRequest struct {
+	Platform
+	BuildConfig
 }
 
 // Sign signs the file using the configured PGP private key

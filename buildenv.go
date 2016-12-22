@@ -100,20 +100,30 @@ func (be BuildEnv) provision() error {
 	// then checkout that version in the temporary GOPATH.
 	for pkg, version := range be.pkgs {
 		// use RepoPath (and TemporaryRepoPath) to ensure we copy the
-		// entire git repository so we can run git commands within them
+		// entire git repository so we can run git commands within them,
+		// this is crucial to compensate for if a plugin's package is
+		// not at the top directory of a repo.
 		srcRepoPath := be.RepoPath(pkg)
 		destRepoPath := be.TemporaryRepoPath(srcRepoPath)
 
-		err := deepCopy(srcRepoPath, destRepoPath, false, false, true)
-		if err != nil {
-			return fmt.Errorf("copying %s: %v", pkg, err)
+		// since multiple plugins can share a repository, we need only
+		// copy the repo once; however, this does present a conflict
+		// if the plugins are requested at different versions.
+		if !dirExists(destRepoPath) {
+			err := deepCopy(srcRepoPath, destRepoPath, false, false, true)
+			if err != nil {
+				return fmt.Errorf("copying %s to %s: %v", srcRepoPath, destRepoPath, err)
+			}
 		}
 
+		// ensure we have the latest refs, to prepare for checkout
 		err = be.gitFetch(be.TemporaryPath(pkg))
 		if err != nil {
 			return fmt.Errorf("git fetch %s: %v", pkg, err)
 		}
 
+		// if multiple plugins share a repository, both plugins end up
+		// at the same version since only the last git checkout "sticks".
 		err = be.gitCheckout(be.TemporaryPath(pkg), version)
 		if err != nil {
 			return fmt.Errorf("git checkout %s @ %s: %v", pkg, version, err)
@@ -299,10 +309,11 @@ func (be BuildEnv) runCommand(cmd *exec.Cmd) error {
 //
 // To "deploy" means that the master GOPATH is updated
 // with `go get -u` on the package being deployed.
-// Package checks are then run for plugin deployments.
+// Package checks are then run for plugin deployments,
+// including cross-platform builds for requiredPlatforms.
 // An error is returned if anything failed, in which case
 // you should consider the deployment/release a failure.
-func (be BuildEnv) Deploy() error {
+func (be BuildEnv) Deploy(requiredPlatforms []Platform) error {
 	// we only allow deploying caddy itself or
 	// a single plugin at a time.
 	switch len(be.pkgs) {
@@ -335,7 +346,7 @@ func (be BuildEnv) Deploy() error {
 	}
 
 	// run checks and report result
-	revert, err := be.RunPluginChecks()
+	revert, err := be.RunPluginChecks(requiredPlatforms)
 	if err != nil && revert {
 		// apparently the caddy tests failed; it _could_ have been
 		// because of the plugin's code, but this is rare, because
@@ -464,14 +475,15 @@ func (be BuildEnv) UpdateMasterGopath() error {
 }
 
 // RunPluginChecks runs checks (vet, test, etc.)
-// on the plugins in this build environment.
+// on the plugins in this build environment, and
+// tries cross-platform builds for requiredPlatforms.
 // While it will work for checking more than one
 // plugin at a time, this kind of use is not
 // recommended. It does not check the core Caddy
 // packages, only plugins. If the master GOPATH
 // should be reverted, the first return value will
 // be true; otherwise a revert is not necessary.
-func (be BuildEnv) RunPluginChecks() (bool, error) {
+func (be BuildEnv) RunPluginChecks(requiredPlatforms []Platform) (bool, error) {
 	rlock(be.masterGopath)
 	defer runlock(be.masterGopath)
 
@@ -509,7 +521,7 @@ func (be BuildEnv) RunPluginChecks() (bool, error) {
 		}
 
 		// go build on various platforms
-		err = be.goBuildChecks(pkg)
+		err = be.goBuildChecks(pkg, requiredPlatforms)
 		if err != nil {
 			return false, fmt.Errorf("go build %s: %v", pkg, err)
 		}
@@ -518,7 +530,7 @@ func (be BuildEnv) RunPluginChecks() (bool, error) {
 	return false, nil
 }
 
-// RunCaddyChecks performs testsn and checks on
+// RunCaddyChecks performs tests and checks on
 // the caddy package in the build environment.
 func (be BuildEnv) RunCaddyChecks() error {
 	err := be.goVet(CaddyPackage)
@@ -532,8 +544,12 @@ func (be BuildEnv) RunCaddyChecks() error {
 		return fmt.Errorf("go test: %v", err)
 	}
 
-	// go build on various platforms
-	err = be.goBuildChecks(CaddyPackage)
+	// go build on all supported platforms
+	platforms, err := SupportedPlatforms(UnsupportedPlatforms)
+	if err != nil {
+		return err
+	}
+	err = be.goBuildChecks(CaddyPackage, platforms)
 	if err != nil {
 		return fmt.Errorf("go build: %v", err)
 	}
@@ -579,7 +595,7 @@ func (be BuildEnv) Build(plat Platform, outputFolder string) (*os.File, error) {
 		outputName += "_custom"
 	}
 
-	binaryOutputName := outputName
+	binaryOutputName := "caddy"
 	if plat.OS == "windows" {
 		binaryOutputName += ".exe"
 	}
@@ -642,23 +658,20 @@ func (be BuildEnv) plugInThePlugin(pkg string) error {
 	return nil
 }
 
-// goBuildChecks cross-compiles pkg on various platforms to
-// ensure it works.
-func (be BuildEnv) goBuildChecks(pkg string) error {
-	platforms, err := SupportedPlatforms(UnsupportedPlatforms)
-	if err != nil {
-		return err
-	}
-
-	for _, platform := range platforms {
+// goBuildChecks cross-compiles pkg for all requiredPlatforms.
+func (be BuildEnv) goBuildChecks(pkg string, requiredPlatforms []Platform) error {
+	for _, platform := range requiredPlatforms {
 		cgo := "CGO_ENABLED=0"
 		if platform.OS == "darwin" {
 			// TODO.
 			// As of Go 1.6, darwin might have some trouble if cgo is disabled.
 			// https://www.reddit.com/r/golang/comments/46bd5h/ama_we_are_the_go_contributors_ask_us_anything/d03rmc9
+			// As of Go 1.8beta3, this may not be necessary:
+			// https://twitter.com/bradfitz/status/811630858742341632
+			// https://github.com/golang/go/commit/3357daa96e2b04f83be70d29b70858ddc7c803f4
 			cgo = "CGO_ENABLED=1"
 		}
-		log.Printf("GOOS=%s GOARCH=%s GOARM=%s go build", platform.OS, platform.Arch, platform.ARM)
+		be.log.Printf("GOOS=%s GOARCH=%s GOARM=%s go build", platform.OS, platform.Arch, platform.ARM)
 		cmd := be.newCommand("go", "build", "-p", strconv.Itoa(ParallelBuildOps), pkg+"/...")
 		for _, env := range []string{
 			cgo,
@@ -692,6 +705,9 @@ func (be BuildEnv) buildCaddy(plat Platform, outputFile string) error {
 		// TODO.
 		// As of Go 1.6, darwin might have some trouble if cgo is disabled.
 		// https://www.reddit.com/r/golang/comments/46bd5h/ama_we_are_the_go_contributors_ask_us_anything/d03rmc9
+		// As of Go 1.8beta3, this may not be necessary:
+		// https://twitter.com/bradfitz/status/811630858742341632
+		// https://github.com/golang/go/commit/3357daa96e2b04f83be70d29b70858ddc7c803f4
 		cgo = "CGO_ENABLED=1"
 	}
 	cmd := be.newCommand("go", "build", "-ldflags", ldflags, "-o", outputFile)
@@ -782,11 +798,17 @@ func SupportedPlatforms(skip []Platform) ([]Platform, error) {
 }
 
 const (
-	MonthDayHourMin  = "01-02-1504"
+	// MonthDayHourMin is the date format used in
+	// some temporary file paths.
+	MonthDayHourMin = "01-02-1504"
+
+	// ParallelBuildOps is how many build operations
+	// to perform in parallel (`go build -p` value).
 	ParallelBuildOps = 4
 
 	CaddyPackage = "github.com/mholt/caddy"
+	// CaddyPackage is the import (package) path to Caddy.
 
-	// the file in which plugins get plugged in
+	// plugInto is the file in which plugins get plugged in
 	plugInto = "caddy/caddymain/run.go"
 )
