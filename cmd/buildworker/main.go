@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,14 +20,15 @@ import (
 	"github.com/caddyserver/buildworker"
 )
 
-var addr = "127.0.0.1:2017"
-
 func init() {
+	flag.StringVar(&addr, "addr", addr, "The address (host:port) to listen on")
 	setAPICredentials()
 	setSigningKey()
 }
 
 func main() {
+	flag.Parse()
+
 	addRoute := func(method, path string, h http.HandlerFunc) {
 		http.HandleFunc(path, methodHandler(method, maxSizeHandler(authHandler(h))))
 	}
@@ -239,8 +241,8 @@ func maxSizeHandler(h http.HandlerFunc) http.HandlerFunc {
 
 func authHandler(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		username, password, ok := r.BasicAuth()
-		if !ok || username != apiUsername || !correctPassword(password) {
+		username, password, _ := r.BasicAuth()
+		if username != apiUsername || !correctPassword(password) {
 			truncPass := password
 			if len(password) > 5 {
 				truncPass = password[:5]
@@ -261,10 +263,14 @@ func correctPassword(pwd string) bool {
 }
 
 func setAPICredentials() {
-	apiUsername = os.Getenv("BUILDSERVER_ID")
+	apiUsername = os.Getenv("BUILDWORKER_CLIENT_ID")
+	envPassword := os.Getenv("BUILDWORKER_CLIENT_KEY")
 	hash := sha1.New()
-	hash.Write([]byte(os.Getenv("BUILDSERVER_KEY")))
+	hash.Write([]byte(envPassword))
 	apiPassword = hash.Sum(nil)
+	if apiUsername == "" && envPassword == "" {
+		fmt.Println("WARNING: No authentication credentials. Set BUILDWORKER_CLIENT_ID and BUILDWORKER_CLIENT_KEY.")
+	}
 }
 
 func setSigningKey() {
@@ -341,3 +347,5 @@ const (
 	defaultSigningKeyFile  = "private_key.asc"
 	defaultKeyPasswordFile = "private_key_password.txt"
 )
+
+var addr = "127.0.0.1:2017"

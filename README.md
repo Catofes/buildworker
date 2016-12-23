@@ -23,10 +23,10 @@ The command of this repository is the production build server, and the library i
 Most basic use:
 
 ```bash
-$ BUILDSERVER_ID=username BUILDSERVER_KEY=password buildworker
+$ BUILDWORKER_CLIENT_ID=username BUILDWORKER_CLIENT_KEY=password buildworker
 ```
 
-Replace the credentials with your own secret values. This will start buildworker listening on 127.0.0.1:2017. All requests to buildworker must be authenticated with HTTP Basic Auth using the credentials you've specified.
+Replace the credentials with your own secret values. This will start buildworker listening on 127.0.0.1:2017 (you can change the address with the `-addr` option). All requests to buildworker must be authenticated using HTTP Basic Auth with the credentials you've specified.
 
 The `buildworker` command will automatically try to load the OpenPGP private key in `private_key.asc` and decrypt it with the password in `private_key_password.txt` so that builds can be signed. You can change these file paths with the `SIGNING_KEY_FILE` and `KEY_PASSWORD_FILE` environment variables, respectively.
 

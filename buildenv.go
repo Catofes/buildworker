@@ -786,7 +786,12 @@ func SupportedPlatforms(skip []Platform) ([]Platform, error) {
 			osMatch := unsup.OS == "" || unsup.OS == p.OS
 			archMatch := unsup.Arch == "" || unsup.Arch == p.Arch
 			armMatch := unsup.ARM == "" || unsup.ARM == p.ARM
-			if osMatch && archMatch && armMatch {
+
+			// along with checking the hard-coded exclusions, we also
+			// skip building ARMv5 for OSes other than linux. see:
+			// https://github.com/golang/go/issues/18418
+			if (osMatch && archMatch && armMatch) ||
+				(p.ARM == "5" && p.OS != "linux") {
 				platforms = append(platforms[:i], platforms[i+1:]...)
 				i--
 				break
